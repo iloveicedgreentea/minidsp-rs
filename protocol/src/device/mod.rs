@@ -18,6 +18,9 @@ pub use probe::{by_kind, probe, probe_kind, DeviceKind};
 #[cfg(feature = "device_2x4hd")]
 pub mod m2x4hd;
 
+#[cfg(feature = "device_2x4hd48")]
+pub mod m2x4hd48;
+
 #[cfg(feature = "device_4x10hd")]
 pub mod m4x10hd;
 

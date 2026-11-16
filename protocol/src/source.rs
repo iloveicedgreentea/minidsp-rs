@@ -38,7 +38,7 @@ impl Source {
         match device_info.hw_id {
             2 | 11 => &[(Toslink, 0), (Spdif, 1)],
             1 | 4 | 5 => &[(Spdif, 0), (Toslink, 1), (Aesebu, 2)],
-            10 if device_info.dsp_version == 100 || device_info.dsp_version == 101 => {
+            10 if matches!(device_info.dsp_version, 99..=101) => {
                 &[(Analog, 0), (Toslink, 1), (Usb, 2)]
             }
             10 => &[(I2S, 0), (Toslink, 1), (Usb, 2)],
@@ -80,5 +80,35 @@ impl Source {
             }
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_analog_instead_of_i2s_for_2x4hd_48khz() {
+        for dsp_version in [99, 100, 101] {
+            let info = DeviceInfo {
+                hw_id: 10,
+                dsp_version,
+                serial: 911111,
+                fw_major: 1,
+                fw_minor: 86,
+            };
+            for (source, id) in [(Source::Analog, 0), (Source::Toslink, 1), (Source::Usb, 2)] {
+                assert_eq!(Source::from_id(id, &info), source);
+                assert_eq!(source.to_id(&info), id);
+            }
+        }
+        let unknown = DeviceInfo {
+            hw_id: 10,
+            dsp_version: 98,
+            serial: 911111,
+            fw_major: 1,
+            fw_minor: 86,
+        };
+        assert_eq!(Source::from_id(0, &unknown), Source::I2S);
     }
 }

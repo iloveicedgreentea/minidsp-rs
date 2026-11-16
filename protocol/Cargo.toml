@@ -20,6 +20,7 @@ debug = ["std"]
 default = ["std", "debug", "symbols", "all_devices"]
 all_devices = [
     "device_2x4hd",
+    "device_2x4hd48",
     "device_msharc4x8",
     "device_10x10hd",
     "device_4x10hd",
@@ -34,6 +35,7 @@ all_devices = [
     "device_flexhtx",
 ]
 device_2x4hd = ["devices"]
+device_2x4hd48 = ["devices"]
 device_4x10hd = ["devices"]
 device_10x10hd = ["devices"]
 device_msharc4x8 = ["devices"]

@@ -1,5 +1,4 @@
 //! TCP server compatible with the official mobile and desktop application
-use core::panic;
 use std::{
     net::{Ipv4Addr, ToSocketAddrs},
     str::FromStr,
@@ -23,7 +22,7 @@ use tokio::{
 };
 use tokio_util::codec::Framed;
 
-use crate::{device_manager::Device, App};
+use crate::device_manager::Device;
 
 use super::config;
 
@@ -76,59 +75,56 @@ where
     }
 }
 
-pub fn start_advertise(app: &App, cfg: Arc<config::TcpServer>) -> Result<(), anyhow::Error> {
-    for srv in &app.config.tcp_servers {
-        if let Some(ref advertise) = srv.advertise {
-            let ip_address = Ipv4Addr::from_str(&advertise.ip)?;
-            let hostname: Arc<str> = Arc::from(advertise.name.clone());
-            let cfg = cfg.clone();
-            let packet_fn = move || -> Option<discovery::DiscoveryPacket> {
-                // Find a suitable device to forward this client to
-                let device = device_matches(&cfg).ok()?;
-                let device_info = device.device_info()?;
+pub fn start_advertise(cfg: Arc<config::TcpServer>) -> Result<(), anyhow::Error> {
+    // Use the same server configuration for the advertised address and device identity.
+    if let Some(ref advertise) = cfg.advertise {
+        let ip_address = Ipv4Addr::from_str(&advertise.ip)?;
+        let hostname: Arc<str> = Arc::from(advertise.name.clone());
+        let cfg = cfg.clone();
+        let packet_fn = move || -> Option<discovery::DiscoveryPacket> {
+            // Find a suitable device to forward this client to
+            let device = device_matches(&cfg).ok()?;
+            let device_info = device.device_info()?;
 
-                let mut packet = discovery::DiscoveryPacket {
-                    // The mac address is used to distinguish between devices on the *device list* page in the MiniDSP Device Console app
-                    mac_address: [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00],
-                    ip_address,
-                    hwid: device_info.hw_id,
-                    dsp_id: device_info.dsp_version,
-                    fw_major: device_info.fw_major,
-                    fw_minor: device_info.fw_minor,
-                    sn: ((device_info.serial - 900000) & 0xFFFF) as u16,
-                    hostname: hostname.to_string(),
-                };
-
-                // Use a unique MAC by stitching the IP's bytes in the last 4 bytes
-                packet.mac_address[2..].copy_from_slice(&packet.ip_address.octets());
-
-                Some(packet)
+            let mut packet = discovery::DiscoveryPacket {
+                // The mac address is used to distinguish between devices on the *device list* page in the MiniDSP Device Console app
+                mac_address: [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00],
+                ip_address,
+                hwid: device_info.hw_id,
+                dsp_id: device_info.dsp_version,
+                fw_major: device_info.fw_major,
+                fw_minor: device_info.fw_minor,
+                sn: ((device_info.serial - 900000) & 0xFFFF) as u16,
+                hostname: hostname.to_string(),
             };
 
-            let bind_addr = match &advertise.bind_address {
-                None => None,
-                Some(addr) => Some(addr.to_socket_addrs()?.next().ok_or_else(|| {
-                    anyhow::anyhow!("bind adddress didn't resolve to a usable address")
-                })?),
-            };
+            // Use a unique MAC by stitching the IP's bytes in the last 4 bytes
+            packet.mac_address[2..].copy_from_slice(&packet.ip_address.octets());
 
-            let interval = Duration::from_secs(1);
-            tokio::spawn(discovery::server::advertise_packet(
-                bind_addr, packet_fn, interval,
-            ));
-        }
+            Some(packet)
+        };
+
+        let bind_addr = match &advertise.bind_address {
+            None => None,
+            Some(addr) => Some(addr.to_socket_addrs()?.next().ok_or_else(|| {
+                anyhow::anyhow!("bind adddress didn't resolve to a usable address")
+            })?),
+        };
+
+        let interval = Duration::from_secs(1);
+        tokio::spawn(discovery::server::advertise_packet(
+            bind_addr, packet_fn, interval,
+        ));
     }
     Ok(())
 }
 
 pub async fn main(cfg: config::TcpServer) -> Result<(), MiniDSPError> {
-    let app = super::APP.get().unwrap();
-    let app = app.read().await;
     let cfg = Arc::new(cfg);
 
     let bind_address = cfg.bind_address.as_deref().unwrap_or("0.0.0.0:5333");
 
-    if let Err(adv_err) = start_advertise(&app, cfg.clone()) {
+    if let Err(adv_err) = start_advertise(cfg.clone()) {
         log::error!("error launching advertisement task: {adv_err:?}");
     }
 
@@ -192,4 +188,104 @@ fn device_matches(cfg: &config::TcpServer) -> Result<Arc<Device>> {
     };
 
     device.ok_or_else(|| anyhow::anyhow!("no matching devices found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tokio::{net::UdpSocket, time::Instant};
+
+    use super::*;
+    use crate::{device_manager::DeviceManager, discovery::Registry, App, Opts, APP};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertisements_keep_each_address_bound_to_its_own_device() -> Result<()> {
+        // Receive real discovery packets, but send them from loopback and advertise
+        // loopback addresses so this test cannot offer a usable bridge on the LAN.
+        let receiver = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery::DISCOVERY_PORT)).await?;
+        let servers = vec![
+            config::TcpServer {
+                bind_address: Some("127.0.0.1:0".into()),
+                device_serial: Some(911111),
+                // An unadvertised local bridge must not start announcements for
+                // the other servers either.
+                ..Default::default()
+            },
+            config::TcpServer {
+                bind_address: Some("127.0.0.1:0".into()),
+                device_serial: Some(911111),
+                advertise: Some(config::Advertise {
+                    ip: "127.0.0.240".into(),
+                    name: "minidsp-rs-test-first".into(),
+                    bind_address: Some("127.0.0.1:0".into()),
+                }),
+                ..Default::default()
+            },
+            config::TcpServer {
+                bind_address: Some("127.0.0.1:0".into()),
+                device_serial: Some(922222),
+                advertise: Some(config::Advertise {
+                    ip: "127.0.0.241".into(),
+                    name: "minidsp-rs-test-second".into(),
+                    bind_address: Some("127.0.0.1:0".into()),
+                }),
+                ..Default::default()
+            },
+        ];
+        APP.set(App::new(
+            Opts::default(),
+            config::Config {
+                tcp_servers: servers.clone(),
+                ignore_advertisements: true,
+                ..Default::default()
+            },
+        ))
+        .ok()
+        .expect("test application should only be initialized once");
+        {
+            let mut app = APP.get().unwrap().write().await;
+            let manager = DeviceManager::new(Registry::new(), HashSet::new(), true);
+            manager.register_static("mock:?serial=911111&dsp_version=99");
+            manager.register_static("mock:?serial=922222&dsp_version=100");
+            app.device_manager = Some(manager);
+        }
+        // Start the real TCP server entry point, including its discovery tasks.
+        let tasks: Vec<_> = servers
+            .into_iter()
+            .map(|cfg| tokio::spawn(main(cfg)))
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut counts = [0, 0];
+        let mut buffer = [0; 1024];
+        while let Ok(result) =
+            tokio::time::timeout_at(deadline, receiver.recv_from(&mut buffer)).await
+        {
+            let (size, _) = result?;
+            let packet = discovery::DiscoveryPacket::parse(&buffer[..size])?;
+            if !packet.hostname.starts_with("minidsp-rs-test-") {
+                continue;
+            }
+            let (index, serial, dsp_id, name) = match packet.ip_address.octets()[3] {
+                240 => (0, 11111, 99, "minidsp-rs-test-first"),
+                241 => (1, 22222, 100, "minidsp-rs-test-second"),
+                _ => panic!("unexpected advertised address: {packet:?}"),
+            };
+            assert_eq!(packet.sn, serial, "wrong serial for {}", packet.ip_address);
+            assert_eq!(packet.dsp_id, dsp_id, "wrong DSP for {}", packet.ip_address);
+            assert_eq!(packet.hostname, name);
+            assert_eq!(packet.mac_address[..2], [0xff, 0xff]);
+            assert_eq!(packet.mac_address[2..], packet.ip_address.octets());
+            counts[index] += 1;
+        }
+        assert!(
+            counts.iter().all(|count| *count >= 2),
+            "missing repeated announcements: {counts:?}"
+        );
+        for task in tasks {
+            assert!(!task.is_finished(), "TCP server exited unexpectedly");
+            task.abort();
+        }
+        Ok(())
+    }
 }

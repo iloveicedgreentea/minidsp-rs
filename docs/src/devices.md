@@ -27,10 +27,17 @@ For these devices, only the following settings can be changed:
 - Dirac Live Status
 
 ### Devices
+- miniDSP 2x4HD (48kHz), hardware ID 10 / DSP ID 99
 - C-DSP 6x8 
 - nanoSHARC series
 - OpenDRC series 
 - nanoAVR HD/HDA
+
+The 48 kHz 2x4HD profile identifies the device and supports the common master
+controls with the correct Analog/Toslink/USB input names. Its internal sample
+rate is 48000 Hz. Channel controls, meters, PEQ, crossovers, delay and FIR are
+not enabled until a 48 kHz DSP parameter map has been verified; the 96 kHz
+profile's addresses are not reused.
 
 # Adding support for new devices
 If you have a device that is on the `Basic Support` tier, you can help adding support by inspecting the commands sent by the plugin application.
