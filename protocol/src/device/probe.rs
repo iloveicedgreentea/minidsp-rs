@@ -27,6 +27,8 @@ pub enum DeviceKind {
     MSharc4x8,
     #[cfg(feature = "device_2x4hd")]
     M2x4Hd,
+    #[cfg(feature = "device_2x4hd48")]
+    M2x4Hd48,
     #[cfg(feature = "device_shd")]
     Shd,
     #[cfg(feature = "device_ddrc24")]
@@ -61,6 +63,8 @@ pub fn probe_kind(device_info: &DeviceInfo) -> DeviceKind {
         (4, _) => MSharc4x8,
         #[cfg(feature = "device_2x4hd")]
         (10, 100) => M2x4Hd,
+        #[cfg(feature = "device_2x4hd48")]
+        (10, 99) => M2x4Hd48,
         #[cfg(feature = "device_ddrc24")]
         (10, 101) => DDRC24,
         #[cfg(feature = "device_ddrc88bm")]
@@ -98,6 +102,9 @@ pub fn by_kind(kind: DeviceKind) -> &'static super::Device {
         #[cfg(feature = "device_2x4hd")]
         M2x4Hd => &super::m2x4hd::DEVICE,
 
+        #[cfg(feature = "device_2x4hd48")]
+        M2x4Hd48 => &super::m2x4hd48::DEVICE,
+
         #[cfg(feature = "device_ddrc24")]
         DDRC24 => &super::ddrc24::DEVICE,
 
@@ -124,5 +131,49 @@ pub fn by_kind(kind: DeviceKind) -> &'static super::Device {
 
         #[cfg(feature = "device_flexhtx")]
         FlexHtx => &super::flexhtx::DEVICE,
+    }
+}
+
+#[cfg(all(test, feature = "device_2x4hd48"))]
+mod tests {
+    use super::*;
+
+    fn info(hw_id: u8, dsp_version: u8) -> DeviceInfo {
+        DeviceInfo {
+            hw_id,
+            dsp_version,
+            serial: 911111,
+            fw_major: 1,
+            fw_minor: 86,
+        }
+    }
+
+    #[test]
+    fn identifies_2x4hd_48khz_by_hardware_and_dsp_id() {
+        let info = info(10, 99);
+        assert_eq!(probe_kind(&info), DeviceKind::M2x4Hd48);
+        let profile = probe(&info);
+        assert_eq!(profile.product_name, "2x4HD (48kHz)");
+        assert_eq!(profile.internal_sampling_rate, 48000);
+        assert_eq!(
+            profile.sources,
+            &[
+                crate::Source::Analog,
+                crate::Source::Toslink,
+                crate::Source::Usb
+            ]
+        );
+        assert!(core::ptr::eq(profile, by_kind(DeviceKind::M2x4Hd48)));
+    }
+
+    #[test]
+    fn does_not_assume_unknown_dsp_ids_are_the_48khz_profile() {
+        for info in [info(10, 98), info(10, 199), info(27, 99)] {
+            assert_eq!(probe_kind(&info), DeviceKind::Generic);
+        }
+        #[cfg(feature = "device_2x4hd")]
+        assert_eq!(probe_kind(&info(10, 100)), DeviceKind::M2x4Hd);
+        #[cfg(feature = "device_ddrc24")]
+        assert_eq!(probe_kind(&info(10, 101)), DeviceKind::DDRC24);
     }
 }
