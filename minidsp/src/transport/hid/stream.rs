@@ -83,35 +83,38 @@ impl HidStream {
         device: Arc<HidDeviceWrapper>,
         tx: mpsc::UnboundedSender<Result<Bytes, HidError>>,
     ) {
-        thread::spawn(move || {
-            loop {
-                if tx.is_closed() {
-                    return Ok::<(), TrySendError<_>>(());
+        thread::spawn(move || Self::recv_loop(|buf| device.read_timeout(buf, 500), tx));
+    }
+
+    fn recv_loop(
+        mut read: impl FnMut(&mut [u8]) -> Result<usize, HidError>,
+        tx: mpsc::UnboundedSender<Result<Bytes, HidError>>,
+    ) -> Result<(), TrySendError<Result<Bytes, HidError>>> {
+        loop {
+            if tx.is_closed() {
+                return Ok(());
+            }
+
+            let mut read_buf = BytesMut::with_capacity(HID_PACKET_SIZE);
+            read_buf.resize(HID_PACKET_SIZE, 0);
+
+            // The supplied read uses a short timeout so dropping the receiver
+            // also lets the USB reader thread stop promptly.
+            match read(&mut read_buf) {
+                // read_timeout returns Ok(0) if a timeout has occurred
+                Ok(0) => continue,
+                Ok(size) => {
+                    read_buf.truncate(size);
+                    log::trace!("read: {:02x?}", read_buf.as_ref());
+                    tx.unbounded_send(Ok(read_buf.freeze()))?;
                 }
-
-                let mut read_buf = BytesMut::with_capacity(HID_PACKET_SIZE);
-                read_buf.resize(HID_PACKET_SIZE, 0);
-
-                // Use a short timeout because we want to be able to bail out if the receiver gets
-                // dropped.
-                let size = device.read_timeout(&mut read_buf, 500);
-                match size {
-                    // read_timeout returns Ok(0) if a timeout has occurred
-                    Ok(0) => continue,
-                    Ok(size) => {
-                        // successful read
-                        read_buf.truncate(size);
-                        log::trace!("read: {:02x?}", read_buf.as_ref());
-                        tx.unbounded_send(Ok(read_buf.freeze()))?;
-                    }
-                    Err(e) => {
-                        // device error
-                        log::error!("error in hid receive loop: {e:?}");
-                        tx.unbounded_send(Err(e))?;
-                    }
+                Err(e) => {
+                    log::error!("error in hid receive loop: {e:?}");
+                    tx.unbounded_send(Err(e))?;
+                    return Ok(());
                 }
             }
-        });
+        }
     }
 }
 
@@ -174,6 +177,37 @@ mod test {
 
     use super::*;
     use crate::transport::hid::initialize_api;
+
+    #[test]
+    fn stops_reading_after_a_device_error() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut reads = 0;
+        HidStream::recv_loop(
+            |buf| {
+                reads += 1;
+                match reads {
+                    1 => Ok(0), // A normal read timeout must not close the stream.
+                    2 => {
+                        buf[..3].copy_from_slice(&[1, 2, 3]);
+                        Ok(3)
+                    }
+                    3 => Err(HidError::HidApiError {
+                        message: "device unplugged".into(),
+                    }),
+                    _ => std::panic!("read attempted again after a device error"),
+                }
+            },
+            tx,
+        )
+        .unwrap();
+        assert_eq!(reads, 3);
+        let frames = futures::executor::block_on(rx.collect::<Vec<_>>());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].as_ref().unwrap().as_ref(), &[1, 2, 3]);
+        assert!(
+            matches!(&frames[1], Err(HidError::HidApiError { message }) if message == "device unplugged")
+        );
+    }
 
     #[tokio::test]
     #[ignore]

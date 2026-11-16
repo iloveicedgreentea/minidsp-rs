@@ -2,7 +2,7 @@
 
 use std::{
     pin::Pin,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
 };
 
@@ -36,21 +36,18 @@ pub struct Hub {
 impl Hub {
     pub fn new(transport: Transport) -> Self {
         let (read_tx, read_rx) = broadcast::channel::<Bytes>(CAPACITY);
+        let read_tx = Arc::new(read_tx);
         let (send_tx, mut send_rx) = mpsc::channel(CAPACITY);
         let (device_tx, mut device_rx) = transport.split();
 
-        let inner = Inner::new(read_tx, device_tx);
+        let inner = Inner::new(Arc::downgrade(&read_tx), device_tx);
 
         let read_handle = {
-            let read_tx_shared = inner.device_rx.clone();
             OwnedJoinHandle::new(tokio::spawn(async move {
                 while let Some(frame) = device_rx.next().await {
                     match frame {
                         Ok(frame) => {
-                            let result = {
-                                let read_tx = read_tx_shared.write().unwrap();
-                                read_tx.send(frame)
-                            };
+                            let result = read_tx.send(frame);
                             if let Err(e) = result {
                                 log::error!("send error {e}");
                                 break;
@@ -118,7 +115,7 @@ impl Hub {
     /// Clones the transport if it is still available, returns None if it has been closed
     pub fn try_clone(&self) -> Option<Self> {
         let inner = self.inner.lock().unwrap();
-        let device_rx = BroadcastStream::new(inner.as_ref()?.device_rx.read().unwrap().subscribe());
+        let device_rx = BroadcastStream::new(inner.as_ref()?.device_rx.upgrade()?.subscribe());
         Some(Self {
             inner: self.inner.clone(),
             handles: self.handles.clone(),
@@ -180,19 +177,70 @@ impl Sink<Bytes> for Hub {
 }
 
 struct Inner {
-    // Broadcast sender used for creating receivers through .subscribe()
-    device_rx: Arc<RwLock<broadcast::Sender<Bytes>>>,
+    // Only the receive task owns the sender. When the transport ends or fails,
+    // dropping it closes every subscriber and lets the device manager reconnect.
+    device_rx: Weak<broadcast::Sender<Bytes>>,
     transport_sink: Arc<tokio::sync::Mutex<SplitSink<Transport, Bytes>>>,
 }
 
 impl Inner {
     pub fn new(
-        device_rx: broadcast::Sender<Bytes>,
+        device_rx: Weak<broadcast::Sender<Bytes>>,
         transport_sink: SplitSink<Transport, Bytes>,
     ) -> Self {
         Self {
-            device_rx: Arc::new(RwLock::new(device_rx)),
+            device_rx,
             transport_sink: Arc::new(tokio::sync::Mutex::new(transport_sink)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::utils::Combine;
+
+    fn test_transport() -> (mpsc::UnboundedSender<Result<Bytes, MiniDSPError>>, Hub) {
+        let (input, stream) = mpsc::unbounded();
+        let (sink, _output) = mpsc::unbounded::<Bytes>();
+        let sink = sink.sink_map_err(|_| MiniDSPError::TransportClosed);
+        (input, Hub::new(Box::pin(Combine::new(stream, sink))))
+    }
+
+    #[tokio::test]
+    async fn closes_all_subscribers_when_transport_ends() {
+        let (input, mut hub) = test_transport();
+        let mut subscriber = hub.try_clone().unwrap();
+        input
+            .unbounded_send(Ok(Bytes::from_static(b"frame")))
+            .unwrap();
+        assert_eq!(hub.next().await.unwrap().unwrap(), &b"frame"[..]);
+        assert_eq!(subscriber.next().await.unwrap().unwrap(), &b"frame"[..]);
+        drop(input);
+        assert!(tokio::time::timeout(Duration::from_secs(1), hub.next())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(subscriber.next().await.is_none());
+        assert!(hub.try_clone().is_none());
+    }
+
+    #[tokio::test]
+    async fn closes_all_subscribers_when_transport_fails() {
+        let (input, mut hub) = test_transport();
+        let mut subscriber = hub.try_clone().unwrap();
+        input
+            .unbounded_send(Err(MiniDSPError::TransportClosed))
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), hub.next())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(subscriber.next().await.is_none());
+        assert!(hub.try_clone().is_none());
+        // Keep the input channel alive: the transport error alone must end the hub.
+        drop(input);
     }
 }
